@@ -44,7 +44,7 @@ pub fn main() anyerror!void {
         {
             game.tick();
 
-            // draw game to framebuffer
+            // Draw game to framebuffer
             rl.BeginTextureMode(framebuffer);
             game.draw();
             rl.EndTextureMode();
@@ -70,8 +70,12 @@ pub const Game = struct {
     camera_x: f32 = 0,
     camera_y: f32 = 0,
     camera_zoom: f32 = 1,
+    screenshake_t: f32 = 0,
 
     particles: std.ArrayList(Particle),
+    // Bitmap denoting which particles in the array are empty or "dead"
+    // This can be used to allocate new particles into and should be skipped over for
+    // ticking and drawing.
     particles_dead: std.bit_set.DynamicBitSet,
 
     pub fn tick(self: *Game) void {
@@ -94,17 +98,27 @@ pub const Game = struct {
             }
         }
 
-        var target_camera_x = self.player.pos.x - consts.screen_width_f * 0.5;
-        var target_camera_y = self.player.pos.y - consts.screen_height_f * 0.5;
-        target_camera_x += self.player.vel.x * 15;
-        target_camera_y += self.player.vel.y * 1;
-        //var k = 1500 / (1 + dt);
-        var k = 100 * dt_norm;
-        self.camera_x = ease(self.camera_x, target_camera_x, k);
-        self.camera_y = ease(self.camera_y, target_camera_y, k);
+        // Update camera
+        {
+            var target_camera_x = self.player.pos.x - consts.screen_width_f * 0.5;
+            var target_camera_y = self.player.pos.y - consts.screen_height_f * 0.5;
+            target_camera_x += self.player.vel.x * 15;
+            target_camera_y += self.player.vel.y * 1;
+            //var k = 1500 / (1 + dt);
+            var k = 100 * dt_norm;
+            self.camera_x = ease(self.camera_x, target_camera_x, k);
+            self.camera_y = ease(self.camera_y, target_camera_y, k);
 
-        self.camera_x = std.math.clamp(self.camera_x, camera_min_x, camera_max_x);
-        self.camera_y = std.math.clamp(self.camera_y, camera_min_y, camera_max_y);
+            self.camera_x = std.math.clamp(self.camera_x, camera_min_x, camera_max_x);
+            self.camera_y = std.math.clamp(self.camera_y, camera_min_y, camera_max_y);
+
+            var player_speed_2 = self.player.vel.x * self.player.vel.x + self.player.vel.y * self.player.vel.y;
+            var player_speed = std.math.sqrt(player_speed_2);
+            var target_camera_zoom = 1 / (1 + player_speed * 0.02);
+            self.camera_zoom = ease(self.camera_zoom, target_camera_zoom, 40);
+
+            self.screenshake_t -= 1;
+        }
     }
 
     pub fn draw(self: *Game) void {
@@ -115,16 +129,23 @@ pub const Game = struct {
             .zoom = self.camera_zoom,
         };
 
-        camera.Begin();
-        //rl.DrawRectangle(camera_min_x, camera_min_y, camera_max_x + 500 - camera_min_x, camera_max_y + 200 - camera_min_y, consts.pico_sea);
+        if (self.screenshake_t > 1) {
+            var rand = FroggyRand.init(@as(u32, @intCast(self.t)));
+            var angle = @as(f32, @floatFromInt(rand.gen_i32_range(.{}, 0, 1000))) / 1000.0 * 3.141 * 2.0;
+            const r = self.screenshake_t * 0.5;
+            var dx = r * std.math.cos(angle);
+            var dy = r * std.math.sin(angle);
+            camera.target.x += dx;
+            camera.target.y += dy;
+        }
 
+        camera.Begin();
         rl.ClearBackground(consts.pico_black);
 
         for (0..50) |i| {
             for (0..50) |j| {
                 const w = 25;
                 var color = consts.pico_sea;
-                //if (((i % 2) == 0) ^ ((j % 2) == 0)) {
                 var a = ((i % 2) == 0);
                 var b = ((j % 2) == 0);
                 // No xor :(
@@ -157,14 +178,19 @@ pub const Game = struct {
         for (0..n) |i| {
             var pos = p_pos;
             var theta = rand.gen_f32_uniform(.{ self.t, i }) * 3.141 * 2.0;
-            pos.x += offset * std.math.cos(theta);
-            pos.y += offset * std.math.sin(theta);
+            var ox = offset * std.math.cos(theta);
+            var oy = offset * std.math.sin(theta);
+            pos.x += ox;
+            pos.y += oy;
 
             var frame = rand.gen_usize_range(.{ self.t, i }, 0, particle_frames.len - 1);
 
+            const speed_k = 0.01;
+            const speed_k_x = 0.03;
             self.create_particle_internal(.{
                 .frame = frame,
                 .pos = pos,
+                .vel = .{ .x = ox * speed_k_x, .y = oy * speed_k },
             });
         }
     }
@@ -215,7 +241,7 @@ pub const Player = struct {
                 game.create_particle(pp, 8, 5);
             } else {
                 var rand = FroggyRand.init(0);
-                if (rand.gen_f32_uniform(.{game.t}) < std.math.fabs(self.vel.x) * 0.03) {
+                if (rand.gen_f32_uniform(.{game.t}) < std.math.fabs(self.vel.x) * 0.02) {
                     var pp = self.pos;
                     pp.y += 5;
                     game.create_particle(pp, 1, 1);
@@ -229,81 +255,70 @@ pub const Player = struct {
             }
         }
 
-        const fric_base = 0.95;
-        const fric_base_x = 0.90;
-
         const move_force = 0.45;
-
-        var fric_x: f32 = fric_base_x;
 
         if (rl.IsKeyDown(rl.KeyboardKey.KEY_LEFT)) {
             self.vel.x -= move_force * dt_norm;
-            //fric_x = fric_high;
         } else if (rl.IsKeyDown(rl.KeyboardKey.KEY_RIGHT)) {
             self.vel.x += move_force * dt_norm;
-            //fric_x = fric_high;
-        } else {
-            fric_x = fric_base_x;
         }
 
         self.pos.x += self.vel.x * dt_norm;
         self.pos.y += self.vel.y * dt_norm;
 
-        {
-            if (self.pos.y + self.hitbox_height * 0.5 >= ground_y) {
-                self.pos.y = ground_y - self.hitbox_height * 0.5;
-                if (self.vel.y > 5) {
-                    var pp = self.pos;
-                    pp.y += 8;
-                    game.create_particle(pp, 8, 5);
-                }
-
-                self.vel.y = 0;
+        if (self.pos.y + self.hitbox_height * 0.5 >= ground_y) {
+            // Just hit ground
+            self.pos.y = ground_y - self.hitbox_height * 0.5;
+            if (self.vel.y > 5) {
+                // Slam ground
+                var pp = self.pos;
+                pp.y += 8;
+                game.create_particle(pp, 8, 5);
+                game.screenshake_t = 15;
             }
 
-            var fric_power = dt_norm;
-            var fric_apply_x = std.math.pow(f32, fric_base_x, fric_power);
-            var fric_apply_y = std.math.pow(f32, fric_base, fric_power);
-
-            self.vel.x *= fric_apply_x;
-            self.vel.y *= fric_apply_y;
+            self.vel.y = 0;
         }
 
-        var delta_x = std.math.fabs(self.pos.x - self.pos_prev.x);
-        var delta_y = std.math.fabs(self.pos.y - self.pos_prev.y);
-        var max_delta: f32 = 0;
-        var x_larger: bool = false;
-        if (delta_x > delta_y) {
-            x_larger = true;
-            max_delta = delta_x;
-        } else {
-            x_larger = false;
-            max_delta = delta_y;
-        }
-        //var max_delta: f32 = 0;
-        //var x_larger: bool = false;
-        //if (std.math.fabs(self.vel.x) > std.math.fabs(self.vel.y)) {
-        //    x_larger = true;
-        //    max_delta = std.math.fabs(self.vel.x);
-        //} else {
-        //    x_larger = false;
-        //    max_delta = std.math.fabs(self.vel.y);
-        //}
+        const fric_base = 0.95;
+        const fric_base_x = 0.90;
 
-        var target_width_mult: f32 = 1;
-        var target_height_mult: f32 = 1;
-        const dk = 0.2;
-        if (x_larger) {
-            target_width_mult = 1 + max_delta * dk;
-            target_height_mult = 1 / (target_width_mult);
-        } else {
-            target_height_mult = 1 + max_delta * dk;
-            target_width_mult = 1 / (target_width_mult);
-        }
+        var fric_power = dt_norm;
+        var fric_apply_x = std.math.pow(f32, fric_base_x, fric_power);
+        var fric_apply_y = std.math.pow(f32, fric_base, fric_power);
 
-        const k = 8;
-        self.draw_width = ease(self.draw_width, self.hitbox_width * target_width_mult, k);
-        self.draw_height = ease(self.draw_height, self.hitbox_height * target_height_mult, k);
+        self.vel.x *= fric_apply_x;
+        self.vel.y *= fric_apply_y;
+
+        {
+            // Squelch
+            var delta_x = std.math.fabs(self.pos.x - self.pos_prev.x);
+            var delta_y = std.math.fabs(self.pos.y - self.pos_prev.y);
+            var max_delta: f32 = 0;
+            var x_larger: bool = false;
+            if (delta_x > delta_y) {
+                x_larger = true;
+                max_delta = delta_x;
+            } else {
+                x_larger = false;
+                max_delta = delta_y;
+            }
+
+            var target_width_mult: f32 = 1;
+            var target_height_mult: f32 = 1;
+            const dk = 0.2;
+            if (x_larger) {
+                target_width_mult = 1 + max_delta * dk;
+                target_height_mult = 1 / (target_width_mult);
+            } else {
+                target_height_mult = 1 + max_delta * dk;
+                target_width_mult = 1 / (target_width_mult);
+            }
+
+            const k = 8;
+            self.draw_width = ease(self.draw_width, self.hitbox_width * target_width_mult, k);
+            self.draw_height = ease(self.draw_height, self.hitbox_height * target_height_mult, k);
+        }
 
         self.pos_prev = self.pos;
         self.vel_prev = self.vel;
@@ -312,6 +327,7 @@ pub const Player = struct {
     pub fn draw(self: *Player) void {
         var p = .{
             .x = self.pos.x - self.draw_width * 0.5,
+            // Draw touching the floor
             .y = self.pos.y + self.hitbox_height * 0.5 - self.draw_height,
         };
 
@@ -321,14 +337,17 @@ pub const Player = struct {
 
 pub const Particle = struct {
     pos: rl.Vector2,
+    vel: rl.Vector2,
     t: i32 = 0,
     scale: f32 = 1.6,
     frame: usize = 0,
 
     pub fn tick(self: *Particle, dt_norm: f32) bool {
+        self.pos.x += self.vel.x * dt_norm;
+        self.pos.y += self.vel.y * dt_norm;
         self.pos.y -= 0.2 * dt_norm;
-        self.scale = self.scale * std.math.pow(f32, 0.94, dt_norm);
-        return self.scale > 0.0001;
+        self.scale = self.scale * std.math.pow(f32, 0.91, dt_norm);
+        return self.scale > 0.001;
     }
 
     pub fn draw(self: *Particle) void {
@@ -359,13 +378,6 @@ fn draw_particle_frame_scaled(frame: usize, pos: rl.Vector2, scale_x: f32, scale
     var no_tint = rl.WHITE;
     rl.DrawTexturePro(sprite, rect, dest, origin, 0, no_tint);
 }
-
-//const ScreenShader = struct {
-//    shader: rl.Shader,
-//    iTime: i32 = 0,
-//    shader_iTime_loc: c_int,
-//    shader_amp_loc: c_int,
-//};
 
 fn draw_framebuffer_to_screen(framebuffer: *rl.RenderTexture2D) void {
     rl.BeginDrawing();
